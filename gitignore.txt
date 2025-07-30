@@ -1,0 +1,5 @@
+.DS_Store
+output-data/match-data/
+.Rhistory
+.Rproj.user
+node_modules
