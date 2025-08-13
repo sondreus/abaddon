@@ -1,9 +1,13 @@
 # Train ML model to predict match outcome based on covariates
 library(agtboost)
 library(tidyverse)
+library(anytime)
+
+cutoff <- Sys.time()
+# cutoff <- as.Date('2025-07-05')
 
 # Load data
-raw <- read_csv('output-data/df_feat.csv')
+raw <- read_csv('output-data/df_feat.csv', show_col_types = FALSE)
 
 # Load splits
 source('scripts/aux_update_and_load_splits.R')
@@ -17,6 +21,7 @@ for(i in 1:ncol(raw)){
     raw[, i] <- as.numeric(as.factor(raw[, i]))
   }
 }
+cat('\n')
 
 # Get ML split:
 ml_subset <- raw[raw$match_id %in% as.numeric(splits %>% filter(split == 'ml_match_model') %>% select(match_id) %>% unlist()), ]
@@ -40,10 +45,13 @@ print('Training GBT: complete')
 print(Sys.time())
 
 gbt.save(gbt_fit, 'output-data/gbt_model.gbt')
-gbt.importance(feature_names = colnames(X), gbt_fit)
+impo <- gbt.importance(feature_names = colnames(X), gbt_fit)
+impo <- data.frame(predictor = names(impo), importance = impo) 
+rownames(impo) <- 1:nrow(impo)
+print(ggplot(impo[1:20, ], aes(y=importance/100, x=reorder(predictor, importance), fill=predictor))+geom_col()+coord_flip()+labs(x='', y='', title='Predictor importance, top 20')+guides(fill='none')+theme_minimal())
 
 # Check how this performs on reserve set:
-X_val <- raw[raw$match_id %in% as.numeric(splits %>% filter(!split == 'latent_skill_model') %>% select(match_id) %>% unlist()), ]
+X_val <- raw[raw$match_id %in% as.numeric(splits %>% filter(!split == 'ml_match_model') %>% select(match_id) %>% unlist()), ]
 
 preds <- predict(newdata = as.matrix(X_val[, colnames(X)]),
                  gbt_fit)
@@ -54,6 +62,6 @@ cor(X_val$win, preds)
 all_preds <- predict(newdata = as.matrix(raw[, colnames(X)]),
                      gbt_fit)
 
-df_feat <- read_csv('output-data/df_feat.csv')
+df_feat <- read_csv('output-data/df_feat.csv', show_col_types = FALSE)
 df_feat$ml_prob <- all_preds
 write_csv(df_feat, 'output-data/df_feat_and_ml.csv')

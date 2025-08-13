@@ -22,14 +22,28 @@ library(anytime)
 library(pbapply)  # for pblapply()
 
 
-read_all_matches <- function(dir = "source-data/match-data/", n = NULL) {
-  files <- list.files(dir, "\\.json$", full.names = TRUE)
+read_all_matches <- function(dir = "source-data/match-data/", n = NULL, cache = NULL) {
+  
+  files <- sort(list.files(dir, "\\.json$", full.names = TRUE))
   if (is.finite(n)) files <- files[seq_len(min(c(n, length(files))))]
   
+  if(!is.null(cache)){
+    cache_csv <- read_csv(cache,
+                          show_col_types = FALSE,
+                          progress       = FALSE) 
+    cached_matches <- unique(cache_csv$match_id)
+    files <- files[!files %in% paste0(dir, '/', cached_matches, '.json')]
+    cat('Cache loaded..\n')
+  }
+  
+  cat(paste0('Adding data from ', length(files), ' matches..\n'))
+ 
+  
+
   df_list <- pblapply(files, function(path) {
     tryCatch({
     m <- fromJSON(path, flatten = FALSE)
-
+    
     # 1) Build the players table: each element of m$players becomes one row
     players <- bind_rows(m$players)
     
@@ -185,12 +199,29 @@ read_all_matches <- function(dir = "source-data/match-data/", n = NULL) {
       return(NULL)})
     })
     
-  bind_rows(df_list)
+  res <- bind_rows(df_list)
+
+  if(!is.null(cache)){
+    for(j in setdiff(colnames(cache_csv), colnames(res))){
+      res[, j] <- NA
+    }
+    for(j in setdiff(colnames(res), colnames(cache_csv))){
+      cache_csv[, j] <- NA
+    }
+    res <- res[, colnames(cache_csv)]
+    
+    if(!identical(colnames(cache_csv), colnames(res))){
+      stop('Cache and latest set of data incompatible')
+    }
+    return(rbind(cache_csv, res))
+  } else {
+    return(res)
+  }
 }
 
 # Usage:
 setwd('/Users/sondresolstad/Github/scrapeman')
-df <- read_all_matches("match_data", n = 1000000)
+df <- read_all_matches("match_data", n = 1000000, cache = "/Users/sondresolstad/Github/abaddon/output-data/df.csv")
 setwd('/Users/sondresolstad/Github/abaddon')
 
 write_csv(df, 'output-data/df.csv')

@@ -4,10 +4,13 @@
 minutes_to_check <- c(5, 10, 15, 20, 25, 30, "end")
 
 # A threshold for collapsing IDs (number of games in which they appear at minimum)
-collapse_n <- 20
+collapse_n <- 10
 
 # A threshold for minimum number of known pro players in a match:
 pro_n_threshold <- 4
+
+# Date cutoff for simulations
+cutoff <- as.Date('2025-06-20')
 
 # Time intervals (seconds)
 # time_intervals <- c(

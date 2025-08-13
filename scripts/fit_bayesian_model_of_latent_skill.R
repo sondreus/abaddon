@@ -7,6 +7,7 @@ options(mc.cores = parallel::detectCores())
 library(dplyr)
 library(stringr)
 library(readr)
+library(anytime)
 
 # ------------------------------------------------------------------------------
 # 1) Raw data: a data.frame `df` with these columns:
@@ -17,14 +18,57 @@ library(readr)
 source('scripts/aux_update_and_load_splits.R')
 
 # Load data
-df <- read_csv("output-data/df_feat_and_ml.csv")
+df <- read_csv("output-data/df_feat_and_ml.csv", show_col_types = FALSE)
 
 # Get latent skill split:
 df <- df[df$match_id %in% as.numeric(splits %>% filter(split == 'latent_skill_model') %>% select(match_id) %>% unlist()), ]
 
-# set.seed(11235)
-# df <- df[df$match_id %in% df$match_id[df$account_id %in% sample(df$account_id[df$is_pro], 5)], ]
-df <- df %>% filter(patch %in% c('56', '57', '58', '59'))
+# Exclude matches which only include players or compositions which too few observations to be modeled individually:
+not_collapsed <- unique(df$match_id[!as.logical(df$collapsed)])
+df <- df %>% filter(match_id %in% not_collapsed)
+
+# Cut-off for betting simulation (now set to middle of sample)
+# df <- df[anytime(df$start_time, calcUnique = T) > as.Date('202-07-22'), ]
+
+# First, collapse patches with insufficient matches
+min_matches <- 400
+patches <- rev(sort(unique(df$patch)))  # newest to oldest
+
+# Collapse insufficient patches into newer ones
+for (i in 2:length(patches)) {
+  n_matches <- sum(df$patch == patches[i]) / 12
+  if (n_matches < min_matches) {
+    cat(sprintf("Collapsing patch %s into %s (%d matches)\n", patches[i], patches[i-1], n_matches))
+    df$patch[df$patch == patches[i]] <- patches[i-1]
+  }
+}
+
+# Check first (newest) patch separately
+patches <- rev(sort(unique(df$patch)))  # refresh after collapsing
+if (length(patches) > 1) {
+  n_matches_first <- sum(df$patch == patches[1]) / 12
+  if (n_matches_first < min_matches) {
+    cat(sprintf("Collapsing patch %s into %s (%d matches)\n", patches[1], patches[2], n_matches_first))
+    df$patch[df$patch == patches[1]] <- patches[2]
+  }
+}
+
+# NOW collapse old patches, but only if we have more than 3 patches remaining
+patches_after_collapse <- rev(sort(unique(df$patch)))
+num_recent_to_keep <- 3
+
+if (length(patches_after_collapse) > num_recent_to_keep) {
+  # The patch to collapse older ones into (3rd most recent)
+  collapse_target <- patches_after_collapse[num_recent_to_keep]
+  
+  # Find patches older than the 3rd most recent
+  patches_to_collapse <- patches_after_collapse[(num_recent_to_keep + 1):length(patches_after_collapse)]
+    
+  # Collapse them
+  df$patch[df$patch %in% patches_to_collapse] <- collapse_target
+  message(sprintf('Patches older than the %d most recent collapsed into patch %s to speed up convergence.', 
+                  num_recent_to_keep, collapse_target))
+}
 
 # 2) Flag compositions vs individual players
 df <- df %>%
@@ -37,6 +81,21 @@ ids <- sort(unique(df$model_id[!df$is_comp]))
 comp_ids   <- sort(unique(df$model_id[df$is_comp ]))
 player_index <- setNames(seq_along(ids), ids)
 comp_index   <- setNames(seq_along(comp_ids),   comp_ids)
+
+# Generate a "comp" description vector
+is_lineup_id <- function(x) grepl("^\\d+_\\d+_\\d+_\\d+_\\d+$", x)
+comp_is_lineup <- is_lineup_id(comp_ids)
+names(comp_is_lineup) <- comp_ids
+
+# choose a default player bucket to stand in for bucketed compositions
+default_player_bucket <- if ("pro_lowdata" %in% ids) {
+  "pro_lowdata"
+} else if ("nonpro_lowdata" %in% ids) {
+  "nonpro_lowdata"
+} else {
+  ids[1]  # safe fallback
+}
+default_idx <- unname(player_index[[default_player_bucket]])
 
 # 4) Dimensions
 match_ids <- sort(unique(df$match_id))
@@ -316,11 +375,31 @@ fit <- stan(
   control    = list(adapt_delta = 0.95)
 )
 print(end_time <- Sys.time())
+saveRDS(list(fit, start_time, end_time, "total_params" = total_params, unique(df$match_id)), paste0('Fit_timing_param_count_n_matches_', Sys.time(), '.RDS'))
+
+# Save posterior draws & metadata for later win‐prob function
+post <- rstan::extract(fit)
+
+library(anytime)
+posterior_filename <- paste0('Posteriors_fit_', Sys.time(), '.RDS')
+saveRDS(
+  list(
+    post          = post,
+    stan_data     = stan_data,
+    comp_ids      = comp_ids,
+    ids            = ids,     
+    patch_values  = patch_values,
+    most_recent_match = max(anytime(df$start_time)),
+    comp_is_lineup       = comp_is_lineup,          
+    default_idx          = default_idx,              
+    default_player_bucket= default_player_bucket     
+  ),
+  file = posterior_filename
+)
 
 #-------------------------------------------------------------------------------
 # 10) Extract & post-process
 #-------------------------------------------------------------------------------
-post <- extract(fit)
 
 # Calculate mean skills for ranking
 mean_player_skills <- colMeans(post$player_skill)
@@ -524,7 +603,7 @@ calib_samp %>%
   scale_size_area("Matches\nper bin") +
   theme_minimal() +
   labs(title = "Reliability (one random posterior draw per match)")+geom_smooth(se = F, method = 'lm', size = 1, col='blue')
-# 
+ 
 # # ALT: 6) Make a reliability diagram on the mean-win-prob version:
 # bins <- 10
 # calib_mean %>%
@@ -546,3 +625,7 @@ calib_samp %>%
 
 source('scripts/aux-save-diagnostics.R')
 save_diagnostics()
+
+source('scripts/aux-future-matches-validation.R')
+results <- validate_on_future_matches(posterior_filename, max_weeks_ahead = 4)
+
