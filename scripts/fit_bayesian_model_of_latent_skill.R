@@ -210,59 +210,85 @@ parameters {
   vector[C]     z_comp;
   real<lower=0> sigma_comp;
 
-  // patch×comp effects, random‐walk in patch dimension
+  // patch×comp effects, random walk
   matrix[K, C]  patch_comp_eff;
-  real<lower=0> sigma_patch_comp;    // step‐size of the RW
+  real<lower=0> sigma_patch_comp;
+
+  // Hierarchical outcome calibration
+  real alpha_win_mu;
+  real<lower=0> beta_win_mu;
+  real<lower=0> sigma_alpha_win;
+  real<lower=0> sigma_beta_win;
+  vector[K] alpha_win_raw;
+  vector<lower=0>[K] beta_win_raw;
+
+  // Decoupled ML-prob calibration (global)
+  real alpha_ml;
+  real<lower=0> beta_ml;
 
   // Beta precisions
-  real<lower=0> phi;
-  real<lower=0> phi_player;
+  real<lower=0> phi_ml;       // for ml_prob
+  real<lower=0> phi_player;   // for ml_prob_player
 }
 
 transformed parameters {
   vector[P] player_skill = z_player * sigma_player;
   vector[C] comp_eff     = z_comp    * sigma_comp;
+
+  vector[K] alpha_win = alpha_win_mu + sigma_alpha_win * alpha_win_raw;
+  vector<lower=0>[K] beta_win = beta_win_mu + sigma_beta_win * beta_win_raw;
 }
 
 model {
-  // Priors for static terms
-  z_player      ~ normal(0,1);
-  sigma_player  ~ normal(0,1);
-  z_comp        ~ normal(0,1);
-  sigma_comp    ~ normal(0,1);
+  // Priors
+  z_player     ~ normal(0,1);
+  z_comp       ~ normal(0,1);
+  sigma_player ~ normal(0,2);
+  sigma_comp   ~ normal(0,2);
 
-  // Random‐walk prior for patch_comp_eff
+  sigma_patch_comp ~ normal(0,1);
   for (c in 1:C) {
-    // initial patch effect
     patch_comp_eff[1, c] ~ normal(0, sigma_patch_comp);
-    // subsequent patches drift around previous
-    for (k in 2:K) {
+    for (k in 2:K)
       patch_comp_eff[k, c] ~ normal(patch_comp_eff[k-1, c], sigma_patch_comp);
-    }
   }
-  sigma_patch_comp ~ normal(0, 1);
 
-  // Beta‐precision priors
-  phi        ~ gamma(5,1);
-  phi_player ~ gamma(5,1);
+  // Hierarchical priors for outcome calibration
+  alpha_win_mu    ~ normal(0,1);
+  beta_win_mu     ~ lognormal(0,0.5);
+  sigma_alpha_win ~ normal(0,0.5);
+  sigma_beta_win  ~ normal(0,0.5);
+  alpha_win_raw   ~ normal(0,1);
+  beta_win_raw    ~ normal(0,1);
 
-  // Likelihood: match‐level
+  // Priors for ML-prob calibration
+  alpha_ml  ~ normal(0,1);
+  beta_ml   ~ lognormal(0,0.5);
+
+  // Precisions
+  phi_ml       ~ gamma(5,1);
+  phi_player   ~ gamma(5,1);
+
+  // Likelihoods
   for (m in 1:M) {
-    real S_home = sum(player_skill[home_players[m]])/5
-                + comp_eff[home_comp[m]]
-                + patch_comp_eff[patch_id[m], home_comp[m]];
-    real S_away = sum(player_skill[away_players[m]])/5
-                + comp_eff[away_comp[m]]
-                + patch_comp_eff[patch_id[m], away_comp[m]];
+    int k = patch_id[m];
+    real S_home = mean(player_skill[home_players[m]]) +
+                  comp_eff[home_comp[m]] +
+                  patch_comp_eff[patch_id[m], home_comp[m]];
+    real S_away = mean(player_skill[away_players[m]]) +
+                  comp_eff[away_comp[m]] +
+                  patch_comp_eff[patch_id[m], away_comp[m]];
     real d      = S_home - S_away;
-    real p      = inv_logit(d);
 
-    win[m]      ~ bernoulli_logit(d);
-    ml_prob[m]  ~ beta(p * phi,
-                       (1 - p) * phi);
+    // (1) Outcome with patch-specific calibration
+    win[m] ~ bernoulli_logit(alpha_win[k] + beta_win[k] * d);
+
+    // (2) ML-prob channel with its own calibration
+    real mu_ml = inv_logit(alpha_ml + beta_ml * d);
+    ml_prob[m] ~ beta(mu_ml * phi_ml, (1 - mu_ml) * phi_ml);
   }
 
-  // player‐specific ML‐probs
+  // Player-level ML-probs (unchanged)
   for (n in 1:Np) {
     ml_prob_player[n]
       ~ beta(inv_logit(player_skill[player_id[n]]) * phi_player,
@@ -276,59 +302,66 @@ model {
 #-------------------------------------------------------------------------------
 # Parameter counting for your Stan model
 # Based on your stan_data structure
-
 cat("=== STAN MODEL PARAMETER COUNT ===\n\n")
 
 # Extract dimensions
-M <- stan_data$M  # matches
-P <- stan_data$P  # unique players (after collapsing)
-C <- stan_data$C  # unique compositions (after collapsing)
-K <- stan_data$K  # patches
+M <- stan_data$M
+P <- stan_data$P
+C <- stan_data$C
+K <- stan_data$K
 
 cat("Data dimensions:\n")
 cat(sprintf("  Matches (M): %d\n", M))
 cat(sprintf("  Players (P): %d\n", P))
 cat(sprintf("  Compositions (C): %d\n", C))
-cat(sprintf("  Patches (K): %d\n", K))
-cat("\n")
-
-# Based on your actual Stan model structure
+cat(sprintf("  Patches (K): %d\n\n", K))
 
 cat("Parameter counts:\n")
 
-# Static player skills (z_player)
+# z_player, z_comp
 z_player_params <- P
+z_comp_params   <- C
 cat(sprintf("  z_player (static): %d\n", z_player_params))
-
-# Static composition effects (z_comp) 
-z_comp_params <- C
 cat(sprintf("  z_comp (static): %d\n", z_comp_params))
 
-# Patch × composition effects (random walk matrix)
+# Patch × comp matrix
 patch_comp_eff_params <- K * C
 cat(sprintf("  patch_comp_eff (K × C): %d × %d = %d\n", K, C, patch_comp_eff_params))
 
-# Scalar hyperparameters
-scalar_params <- 5
-cat(sprintf("  Scalar hyperparameters: %d\n", scalar_params))
-cat("    - sigma_player, sigma_comp, sigma_patch_comp, phi, phi_player\n")
+# Patch-specific calibration (alpha_win[k], beta_win[k])
+alpha_beta_patch_params <- 2 * K
+cat(sprintf("  patch calibration (alpha_win & beta_win): 2 × %d = %d\n",
+            K, alpha_beta_patch_params))
 
-# Total count
-total_params <- z_player_params + z_comp_params + patch_comp_eff_params + scalar_params
+# Scalars (see list below): 3 + 2 + 2 + 2 + 2 = 11
+#   3: sigma_player, sigma_comp, sigma_patch_comp
+#   2: phi_ml, phi_player
+#   2: alpha_win_mu, beta_win_mu
+#   2: sigma_alpha_win, sigma_beta_win
+#   2: alpha_ml, beta_ml
+scalar_params <- 3 + 2 + 2 + 2 + 2
+cat(sprintf("  Scalar hyperparameters: %d\n", scalar_params))
+cat("    - sigma_player, sigma_comp, sigma_patch_comp,\n")
+cat("      phi_ml, phi_player,\n")
+cat("      alpha_win_mu, beta_win_mu,\n")
+cat("      sigma_alpha_win, sigma_beta_win,\n")
+cat("      alpha_ml, beta_ml\n")
+
+# Totals
+total_params <- z_player_params + z_comp_params +
+  patch_comp_eff_params + alpha_beta_patch_params + scalar_params
 
 cat(sprintf("\nTOTAL PARAMETERS: %d\n", total_params))
 
-# Compare to what you would have had without collapsing
+# Comparison to uncollapsed
 cat("\n=== COMPARISON TO UNCOLLAPSED ===\n")
-
-# Get original counts from your data
 original_players <- length(unique(df$id[!df$is_comp]))
-original_comps <- length(unique(df$id[df$is_comp]))
-
-original_z_player <- original_players
-original_z_comp <- original_comps  
-original_patch_comp <- K * original_comps
-original_total <- original_z_player + original_z_comp + original_patch_comp + scalar_params
+original_comps   <- length(unique(df$id[df$is_comp]))
+original_z_player    <- original_players
+original_z_comp      <- original_comps
+original_patch_comp  <- K * original_comps
+original_total <- original_z_player + original_z_comp +
+  original_patch_comp + alpha_beta_patch_params + scalar_params
 
 cat(sprintf("Original players: %d\n", original_players))
 cat(sprintf("Original compositions: %d\n", original_comps))
@@ -337,30 +370,24 @@ cat(sprintf("Original total parameters: %d\n", original_total))
 reduction <- 1 - (total_params / original_total)
 cat(sprintf("Parameter reduction: %.1f%%\n", reduction * 100))
 
-# Rough sampling time estimate (very approximate!)
-if(total_params < 1000) {
-  est_time <- "Fast (minutes)"
-} else if(total_params < 5000) {
-  est_time <- "Moderate (tens of minutes to hours)"
-} else if(total_params < 20000) {
-  est_time <- "Slow (hours)"
-} else {
-  est_time <- "Very slow (many hours+)"
-}
-
+# Crude timing bucket
+est_time <- if (total_params < 1000) "Fast (minutes)" else
+  if (total_params < 5000) "Moderate (tens of minutes to hours)" else
+    if (total_params < 20000) "Slow (hours)" else "Very slow (many hours+)"
 cat(sprintf("\nTOTAL PARAMETERS: %d\n", total_params))
 cat(sprintf("Estimated sampling time: %s\n", est_time))
 
-# Show breakdown by category
+# Breakdown table (include patch calibration)
 cat("\n=== PARAMETER BREAKDOWN ===\n")
 breakdown <- data.frame(
-  Category = c("z_player (static)", "z_comp (static)", "patch_comp_eff (K×C)", 
+  Category = c("z_player (static)", "z_comp (static)",
+               "patch_comp_eff (K×C)", "patch calibration (2×K)",
                "Scalar hyperparams"),
-  Count = c(z_player_params, z_comp_params, patch_comp_eff_params, scalar_params),
-  Percentage = c(z_player_params, z_comp_params, patch_comp_eff_params, 
-                 scalar_params) / total_params * 100
+  Count = c(z_player_params, z_comp_params,
+            patch_comp_eff_params, alpha_beta_patch_params,
+            scalar_params)
 )
-
+breakdown$Percentage <- 100 * breakdown$Count / total_params
 print(breakdown)
 
 print(start_time <- Sys.time())
@@ -375,7 +402,7 @@ fit <- stan(
   control    = list(adapt_delta = 0.95)
 )
 print(end_time <- Sys.time())
-saveRDS(list(fit, start_time, end_time, "total_params" = total_params, unique(df$match_id)), paste0('Fit_timing_param_count_n_matches_', Sys.time(), '.RDS'))
+saveRDS(list(fit, start_time, end_time, "total_params" = total_params, "match_ids" = unique(df$match_id)), paste0('Fit_timing_param_count_n_matches_', Sys.time(), '.RDS'))
 
 # Save posterior draws & metadata for later win‐prob function
 post <- rstan::extract(fit)
@@ -392,7 +419,8 @@ saveRDS(
     most_recent_match = max(anytime(df$start_time)),
     comp_is_lineup       = comp_is_lineup,          
     default_idx          = default_idx,              
-    default_player_bucket= default_player_bucket     
+    default_player_bucket= default_player_bucket,
+    calibration="hierarchical"
   ),
   file = posterior_filename
 )
@@ -482,7 +510,10 @@ cat("Home composition: ", comp_ids[home_co], "\n")
 cat("Away composition: ", comp_ids[away_co], "\n")
 
 # Calculate and show predicted probability
-prob_home_wins <- mean(plogis(S_home - S_away))
+k_match <- patch_id[i_match]
+prob_home_wins <- mean(plogis(post$alpha_win[, k_match] +
+                                post$beta_win[, k_match] * (S_home - S_away)))
+
 cat(sprintf("Predicted P(Home wins): %.3f\n", prob_home_wins))
 
 # 14) Put into a data.frame for ggplot
@@ -556,7 +587,9 @@ for (m in seq_len(M)) {
   S_away <- rowMeans(post$player_skill[, away_players[m, ]]) +
     post$comp_eff[, away_comp[m]] +
     post$patch_comp_eff[, patch_id[m], away_comp[m]]
-  p_draws[, m] <- plogis(S_home - S_away)
+  k_match <- patch_id[m]
+  p_draws[, m] <- plogis(post$alpha_win[, k_match] +
+                           post$beta_win[, k_match] * (S_home - S_away))
 }
 
 # 2) Now either

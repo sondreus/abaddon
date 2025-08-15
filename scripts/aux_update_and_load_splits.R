@@ -21,7 +21,9 @@ if(cutoff == readRDS('output-data/splits_cutoff_cache.RDS')){
   match_ids <- match_ids[!match_ids %in% splits$match_id]
   
 } else {
-  splits <- data.frame()
+  splits <- data.frame(match_id = character(),
+                       split = character(),
+                       stringsAsFactors = FALSE)
 }
 saveRDS(cutoff, 'output-data/splits_cutoff_cache.RDS')
 

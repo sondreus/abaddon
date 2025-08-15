@@ -3,9 +3,6 @@ library(agtboost)
 library(tidyverse)
 library(anytime)
 
-cutoff <- Sys.time()
-# cutoff <- as.Date('2025-07-05')
-
 # Load data
 raw <- read_csv('output-data/df_feat.csv', show_col_types = FALSE)
 
