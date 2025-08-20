@@ -8,6 +8,8 @@ library(dplyr)
 library(stringr)
 library(readr)
 library(anytime)
+library(pROC)
+library(scales)
 
 # ------------------------------------------------------------------------------
 # 1) Raw data: a data.frame `df` with these columns:
@@ -207,20 +209,16 @@ parameters {
   // static skills
   vector[P]     z_player;
   real<lower=0> sigma_player;
-  vector[C]     z_comp;
+  vector[C]     z_comp_raw;
   real<lower=0> sigma_comp;
 
   // patch×comp effects, random walk
-  matrix[K, C]  patch_comp_eff;
+  matrix[K, C]  patch_comp_eff_raw;
   real<lower=0> sigma_patch_comp;
 
-  // Hierarchical outcome calibration
-  real alpha_win_mu;
-  real<lower=0> beta_win_mu;
-  real<lower=0> sigma_alpha_win;
-  real<lower=0> sigma_beta_win;
-  vector[K] alpha_win_raw;
-  vector<lower=0>[K] beta_win_raw;
+  // Global outcome calibration
+  real alpha_win;
+  real<lower=0> beta_win;
 
   // Decoupled ML-prob calibration (global)
   real alpha_ml;
@@ -233,33 +231,36 @@ parameters {
 
 transformed parameters {
   vector[P] player_skill = z_player * sigma_player;
-  vector[C] comp_eff     = z_comp    * sigma_comp;
-
-  vector[K] alpha_win = alpha_win_mu + sigma_alpha_win * alpha_win_raw;
-  vector<lower=0>[K] beta_win = beta_win_mu + sigma_beta_win * beta_win_raw;
+  // mean-zero constraint on comp effects
+  vector[C] comp_eff = sigma_comp * (z_comp_raw - mean(z_comp_raw));
+  
+  // patch×comp deviations: center within each comp so sum_k patch_comp_eff[k,c] = 0
+  matrix[K, C] patch_comp_eff;
+  for (c in 1:C) {
+    real mu_c = 0;
+    for (k in 1:K) mu_c += patch_comp_eff_raw[k, c];
+    mu_c /= K;
+    for (k in 1:K) patch_comp_eff[k, c] = patch_comp_eff_raw[k, c] - mu_c;
+  }
 }
 
 model {
   // Priors
   z_player     ~ normal(0,1);
-  z_comp       ~ normal(0,1);
+  z_comp_raw   ~ normal(0,1);
   sigma_player ~ normal(0,2);
   sigma_comp   ~ normal(0,2);
 
   sigma_patch_comp ~ normal(0,1);
   for (c in 1:C) {
-    patch_comp_eff[1, c] ~ normal(0, sigma_patch_comp);
+    patch_comp_eff_raw[1, c] ~ normal(0, sigma_patch_comp);
     for (k in 2:K)
-      patch_comp_eff[k, c] ~ normal(patch_comp_eff[k-1, c], sigma_patch_comp);
+      patch_comp_eff_raw[k, c] ~ normal(patch_comp_eff_raw[k-1, c], sigma_patch_comp);
   }
 
-  // Hierarchical priors for outcome calibration
-  alpha_win_mu    ~ normal(0,1);
-  beta_win_mu     ~ lognormal(0,0.5);
-  sigma_alpha_win ~ normal(0,0.5);
-  sigma_beta_win  ~ normal(0,0.5);
-  alpha_win_raw   ~ normal(0,1);
-  beta_win_raw    ~ normal(0,1);
+  // Global priors for outcome calibration
+  alpha_win ~ normal(0,1);
+  beta_win  ~ lognormal(0,0.5);
 
   // Priors for ML-prob calibration
   alpha_ml  ~ normal(0,1);
@@ -271,7 +272,6 @@ model {
 
   // Likelihoods
   for (m in 1:M) {
-    int k = patch_id[m];
     real S_home = mean(player_skill[home_players[m]]) +
                   comp_eff[home_comp[m]] +
                   patch_comp_eff[patch_id[m], home_comp[m]];
@@ -280,15 +280,15 @@ model {
                   patch_comp_eff[patch_id[m], away_comp[m]];
     real d      = S_home - S_away;
 
-    // (1) Outcome with patch-specific calibration
-    win[m] ~ bernoulli_logit(alpha_win[k] + beta_win[k] * d);
+    // (1) Outcome with global calibration
+    win[m] ~ bernoulli_logit(alpha_win + beta_win * d);
 
     // (2) ML-prob channel with its own calibration
     real mu_ml = inv_logit(alpha_ml + beta_ml * d);
     ml_prob[m] ~ beta(mu_ml * phi_ml, (1 - mu_ml) * phi_ml);
   }
 
-  // Player-level ML-probs (unchanged)
+  // Player-level ML-probs
   for (n in 1:Np) {
     ml_prob_player[n]
       ~ beta(inv_logit(player_skill[player_id[n]]) * phi_player,
@@ -318,39 +318,33 @@ cat(sprintf("  Patches (K): %d\n\n", K))
 
 cat("Parameter counts:\n")
 
-# z_player, z_comp
 z_player_params <- P
-z_comp_params   <- C
-cat(sprintf("  z_player (static): %d\n", z_player_params))
-cat(sprintf("  z_comp (static): %d\n", z_comp_params))
-
-# Patch × comp matrix
+z_comp_params   <- C  # raw comps
 patch_comp_eff_params <- K * C
+
+# scalar hyperparameters: list explicitly
+scalar_params <- c(
+  sigma_player     = 1,
+  sigma_comp       = 1,
+  sigma_patch_comp = 1,
+  phi_ml           = 1,
+  phi_player       = 1,
+  alpha_win        = 1,
+  beta_win         = 1,
+  alpha_ml         = 1,
+  beta_ml          = 1
+)
+
+cat("Parameter counts:\n")
+cat(sprintf("  z_player: %d\n", z_player_params))
+cat(sprintf("  z_comp_raw: %d\n", z_comp_params))
 cat(sprintf("  patch_comp_eff (K × C): %d × %d = %d\n", K, C, patch_comp_eff_params))
+cat(sprintf("  Scalars: %d\n", sum(scalar_params)))
 
-# Patch-specific calibration (alpha_win[k], beta_win[k])
-alpha_beta_patch_params <- 2 * K
-cat(sprintf("  patch calibration (alpha_win & beta_win): 2 × %d = %d\n",
-            K, alpha_beta_patch_params))
+player_skill_params <- P
+comp_eff_params     <- C
 
-# Scalars (see list below): 3 + 2 + 2 + 2 + 2 = 11
-#   3: sigma_player, sigma_comp, sigma_patch_comp
-#   2: phi_ml, phi_player
-#   2: alpha_win_mu, beta_win_mu
-#   2: sigma_alpha_win, sigma_beta_win
-#   2: alpha_ml, beta_ml
-scalar_params <- 3 + 2 + 2 + 2 + 2
-cat(sprintf("  Scalar hyperparameters: %d\n", scalar_params))
-cat("    - sigma_player, sigma_comp, sigma_patch_comp,\n")
-cat("      phi_ml, phi_player,\n")
-cat("      alpha_win_mu, beta_win_mu,\n")
-cat("      sigma_alpha_win, sigma_beta_win,\n")
-cat("      alpha_ml, beta_ml\n")
-
-# Totals
-total_params <- z_player_params + z_comp_params +
-  patch_comp_eff_params + alpha_beta_patch_params + scalar_params
-
+total_params <- z_player_params + z_comp_params + patch_comp_eff_params + sum(scalar_params) + player_skill_params + comp_eff_params
 cat(sprintf("\nTOTAL PARAMETERS: %d\n", total_params))
 
 # Comparison to uncollapsed
@@ -360,8 +354,7 @@ original_comps   <- length(unique(df$id[df$is_comp]))
 original_z_player    <- original_players
 original_z_comp      <- original_comps
 original_patch_comp  <- K * original_comps
-original_total <- original_z_player + original_z_comp +
-  original_patch_comp + alpha_beta_patch_params + scalar_params
+original_total <- original_z_player + original_z_comp + original_patch_comp + sum(scalar_params) +comp_eff_params+player_skill_params
 
 cat(sprintf("Original players: %d\n", original_players))
 cat(sprintf("Original compositions: %d\n", original_comps))
@@ -380,12 +373,12 @@ cat(sprintf("Estimated sampling time: %s\n", est_time))
 # Breakdown table (include patch calibration)
 cat("\n=== PARAMETER BREAKDOWN ===\n")
 breakdown <- data.frame(
-  Category = c("z_player (static)", "z_comp (static)",
-               "patch_comp_eff (K×C)", "patch calibration (2×K)",
-               "Scalar hyperparams"),
-  Count = c(z_player_params, z_comp_params,
-            patch_comp_eff_params, alpha_beta_patch_params,
-            scalar_params)
+    Category = c("z_player (static)", "z_comp (static)",
+                                 "patch_comp_eff (K×C)",
+                                 "Scalar hyperparams"),
+    Count = c(z_player_params, z_comp_params,
+                           patch_comp_eff_params,
+                           scalar_params)
 )
 breakdown$Percentage <- 100 * breakdown$Count / total_params
 print(breakdown)
@@ -420,7 +413,7 @@ saveRDS(
     comp_is_lineup       = comp_is_lineup,          
     default_idx          = default_idx,              
     default_player_bucket= default_player_bucket,
-    calibration="hierarchical"
+    calibration="global"
   ),
   file = posterior_filename
 )
@@ -428,154 +421,154 @@ saveRDS(
 #-------------------------------------------------------------------------------
 # 10) Extract & post-process
 #-------------------------------------------------------------------------------
-
-# Calculate mean skills for ranking
-mean_player_skills <- colMeans(post$player_skill)
-mean_comp_skills <- colMeans(post$comp_eff)
-
-# Get top 5 players by skill
-top_players_idx <- order(mean_player_skills, decreasing = TRUE)[1:5]
-top_players_skills <- mean_player_skills[top_players_idx]
-
-cat("=== TOP 5 PLAYERS BY SKILL ===\n")
-for(i in 1:5) {
-  player_idx <- top_players_idx[i]
-  player_id <- ids[player_idx]
-  skill <- top_players_skills[i]
-  # Get 90% credible interval
-  skill_samples <- post$player_skill[, player_idx]
-  ci_low <- quantile(skill_samples, 0.05)
-  ci_high <- quantile(skill_samples, 0.95)
+# Example output:
+if(F){
+  # Calculate mean skills for ranking
+  mean_player_skills <- colMeans(post$player_skill)
+  mean_comp_skills <- colMeans(post$comp_eff)
   
-  cat(sprintf("%d. Player ID: %s | Skill: %.3f (90%% CI: %.3f, %.3f)\n", 
-              i, player_id, skill, ci_low, ci_high))
-}
-
-# Get top 5 compositions by skill  
-top_comps_idx <- order(mean_comp_skills, decreasing = TRUE)[1:5]
-top_comps_skills <- mean_comp_skills[top_comps_idx]
-
-cat("\n=== TOP 5 COMPOSITIONS BY SKILL ===\n")
-for(i in 1:5) {
-  comp_idx <- top_comps_idx[i]
-  comp_id <- comp_ids[comp_idx]
-  skill <- top_comps_skills[i]
-  # Get 90% credible interval
-  skill_samples <- post$comp_eff[, comp_idx]
-  ci_low <- quantile(skill_samples, 0.05)
-  ci_high <- quantile(skill_samples, 0.95)
+  # Get top 5 players by skill
+  top_players_idx <- order(mean_player_skills, decreasing = TRUE)[1:5]
+  top_players_skills <- mean_player_skills[top_players_idx]
   
-  cat(sprintf("%d. Composition ID: %s | Skill: %.3f (90%% CI: %.3f, %.3f)\n", 
-              i, comp_id, skill, ci_low, ci_high))
-}
-
-# Find match with highest skilled player
-highest_skilled_player_idx <- which.max(mean_player_skills)
-highest_skilled_player_id <- ids[highest_skilled_player_idx]
-
-# Find matches containing this player
-matches_with_top_player <- which(apply(home_players, 1, function(row) highest_skilled_player_idx %in% row) |
-                                   apply(away_players, 1, function(row) highest_skilled_player_idx %in% row))
-
-if(length(matches_with_top_player) > 0) {
-  # Pick the first match with the highest skilled player
-  i_match <- matches_with_top_player[1]
+  cat("=== TOP 5 PLAYERS BY SKILL ===\n")
+  for(i in 1:5) {
+    player_idx <- top_players_idx[i]
+    player_id <- ids[player_idx]
+    skill <- top_players_skills[i]
+    # Get 90% credible interval
+    skill_samples <- post$player_skill[, player_idx]
+    ci_low <- quantile(skill_samples, 0.05)
+    ci_high <- quantile(skill_samples, 0.95)
+    
+    cat(sprintf("%d. Player ID: %s | Skill: %.3f (90%% CI: %.3f, %.3f)\n", 
+                i, player_id, skill, ci_low, ci_high))
+  }
   
-  cat(sprintf("\n=== MATCH WITH HIGHEST SKILLED PLAYER ===\n"))
-  cat(sprintf("Match #%d contains highest skilled player: %s (skill: %.3f)\n", 
-              i_match, highest_skilled_player_id, mean_player_skills[highest_skilled_player_idx]))
-} else {
-  # Fallback to random match if somehow no matches found
-  set.seed(42)
-  i_match <- sample(seq_len(M), 1)
-  cat(sprintf("\n=== RANDOM MATCH (no matches found with top player) ===\n"))
-}
-
-# 12) Get the two lineups and comps for that match
-home_pl <- home_players[i_match, ]    # 5‐vector of player‐indices
-away_pl <- away_players[i_match, ]
-home_co <- home_comp[i_match]         # single comp‐index
-away_co <- away_comp[i_match]
-
-# 13) Compute posterior draws of latent skill
-S_home <- rowMeans(post$player_skill[, home_pl]) + post$comp_eff[, home_co] +  post$patch_comp_eff[, patch_id[i_match], home_co]
-
-S_away <- rowMeans(post$player_skill[, away_pl]) + post$comp_eff[, away_co] +  post$patch_comp_eff[, patch_id[i_match], away_co]
-
-# Show match details
-cat(sprintf("\nMatch #%d details:\n", i_match))
-cat("Home players: ", paste(ids[home_pl], collapse = ", "), "\n")
-cat("Away players: ", paste(ids[away_pl], collapse = ", "), "\n")
-cat("Home composition: ", comp_ids[home_co], "\n")
-cat("Away composition: ", comp_ids[away_co], "\n")
-
-# Calculate and show predicted probability
-k_match <- patch_id[i_match]
-prob_home_wins <- mean(plogis(post$alpha_win[, k_match] +
-                                post$beta_win[, k_match] * (S_home - S_away)))
-
-cat(sprintf("Predicted P(Home wins): %.3f\n", prob_home_wins))
-
-# 14) Put into a data.frame for ggplot
-plot_df <- data.frame(
-  Skill = c(S_home, S_away),
-  Team  = rep(c("Home","Away"), each = length(S_home))
-)
-
-# 15) Plot densities
-library(ggplot2)
-ggplot(plot_df, aes(x = Skill, fill = Team)) +
-  geom_density(alpha = 0.5) +
-  theme_minimal() +
-  labs(
-    title = paste0(
-      "Match #", i_match, ": Home vs Away\n",
-      "Home players = ", paste(ids[home_pl], collapse = ","),
-      " | Away players = ", paste(ids[away_pl], collapse = ",")
-    ),
-    x = "Latent Skill",
-    y = "Density"
+  # Get top 5 compositions by skill  
+  top_comps_idx <- order(mean_comp_skills, decreasing = TRUE)[1:5]
+  top_comps_skills <- mean_comp_skills[top_comps_idx]
+  
+  cat("\n=== TOP 5 COMPOSITIONS BY SKILL ===\n")
+  for(i in 1:5) {
+    comp_idx <- top_comps_idx[i]
+    comp_id <- comp_ids[comp_idx]
+    skill <- top_comps_skills[i]
+    # Get 90% credible interval
+    skill_samples <- post$comp_eff[, comp_idx]
+    ci_low <- quantile(skill_samples, 0.05)
+    ci_high <- quantile(skill_samples, 0.95)
+    
+    cat(sprintf("%d. Composition ID: %s | Skill: %.3f (90%% CI: %.3f, %.3f)\n", 
+                i, comp_id, skill, ci_low, ci_high))
+  }
+  
+  # Find match with highest skilled player
+  highest_skilled_player_idx <- which.max(mean_player_skills)
+  highest_skilled_player_id <- ids[highest_skilled_player_idx]
+  
+  # Find matches containing this player
+  matches_with_top_player <- which(apply(home_players, 1, function(row) highest_skilled_player_idx %in% row) |
+                                     apply(away_players, 1, function(row) highest_skilled_player_idx %in% row))
+  
+  if(length(matches_with_top_player) > 0) {
+    # Pick the first match with the highest skilled player
+    i_match <- matches_with_top_player[1]
+    
+    cat(sprintf("\n=== MATCH WITH HIGHEST SKILLED PLAYER ===\n"))
+    cat(sprintf("Match #%d contains highest skilled player: %s (skill: %.3f)\n", 
+                i_match, highest_skilled_player_id, mean_player_skills[highest_skilled_player_idx]))
+  } else {
+    # Fallback to random match if somehow no matches found
+    set.seed(42)
+    i_match <- sample(seq_len(M), 1)
+    cat(sprintf("\n=== RANDOM MATCH (no matches found with top player) ===\n"))
+  }
+  
+  # 12) Get the two lineups and comps for that match
+  home_pl <- home_players[i_match, ]    # 5‐vector of player‐indices
+  away_pl <- away_players[i_match, ]
+  home_co <- home_comp[i_match]         # single comp‐index
+  away_co <- away_comp[i_match]
+  
+  # 13) Compute posterior draws of latent skill
+  S_home <- rowMeans(post$player_skill[, home_pl]) + post$comp_eff[, home_co] +  post$patch_comp_eff[, patch_id[i_match], home_co]
+  
+  S_away <- rowMeans(post$player_skill[, away_pl]) + post$comp_eff[, away_co] +  post$patch_comp_eff[, patch_id[i_match], away_co]
+  
+  # Show match details
+  cat(sprintf("\nMatch #%d details:\n", i_match))
+  cat("Home players: ", paste(ids[home_pl], collapse = ", "), "\n")
+  cat("Away players: ", paste(ids[away_pl], collapse = ", "), "\n")
+  cat("Home composition: ", comp_ids[home_co], "\n")
+  cat("Away composition: ", comp_ids[away_co], "\n")
+  
+  # Calculate and show predicted probability
+  prob_home_wins <- mean(plogis(post$alpha_win + post$beta_win * (S_home - S_away)))
+  
+  cat(sprintf("Predicted P(Home wins): %.3f\n", prob_home_wins))
+  
+  # 14) Put into a data.frame for ggplot
+  plot_df <- data.frame(
+    Skill = c(S_home, S_away),
+    Team  = rep(c("Home","Away"), each = length(S_home))
   )
-
-# Bonus: Show which team has the highest skilled player if it's in this match
-if(highest_skilled_player_idx %in% home_pl) {
-  cat(sprintf("\n*** Highest skilled player (%s) is on HOME team! ***\n", highest_skilled_player_id))
-} else if(highest_skilled_player_idx %in% away_pl) {
-  cat(sprintf("\n*** Highest skilled player (%s) is on AWAY team! ***\n", highest_skilled_player_id))
+  
+  # 15) Plot densities
+  library(ggplot2)
+  ggplot(plot_df, aes(x = Skill, fill = Team)) +
+    geom_density(alpha = 0.5) +
+    theme_minimal() +
+    labs(
+      title = paste0(
+        "Match #", i_match, ": Home vs Away\n",
+        "Home players = ", paste(ids[home_pl], collapse = ","),
+        " | Away players = ", paste(ids[away_pl], collapse = ",")
+      ),
+      x = "Latent Skill",
+      y = "Density"
+    )
+  
+  # Bonus: Show which team has the highest skilled player if it's in this match
+  if(highest_skilled_player_idx %in% home_pl) {
+    cat(sprintf("\n*** Highest skilled player (%s) is on HOME team! ***\n", highest_skilled_player_id))
+  } else if(highest_skilled_player_idx %in% away_pl) {
+    cat(sprintf("\n*** Highest skilled player (%s) is on AWAY team! ***\n", highest_skilled_player_id))
+  }
+  
+  # 16) Plot player‐skill densities for the 10 players in the selected match
+  library(tidyr)
+  library(pROC)
+  library(scales)
+  
+  # Get the 10 player indices and their names
+  players       <- c(home_players[i_match, ], away_players[i_match, ])
+  player_names  <- ids[players]
+  
+  # Extract posterior draws for those players
+  # post$player_skill is [draws × P]
+  draws_mat     <- post$player_skill[, players]
+  colnames(draws_mat) <- player_names
+  
+  # Reshape to long for ggplot
+  player_df <- as.data.frame(draws_mat) %>%
+    pivot_longer(cols      = everything(),
+                 names_to  = "Player",
+                 values_to = "Skill")
+  
+  # Plot density for each player
+  ggplot(player_df, aes(x = Skill, fill = Player)) +
+    geom_density(alpha = 0.5) +
+    theme_minimal() +
+    labs(
+      title = paste0("Posterior Skill Distributions for Players in Match #", match_ids[i_match]),
+      x     = "Latent Skill",
+      y     = "Density"
+    ) +
+    theme(legend.position = "right")
 }
 
-# 16) Plot player‐skill densities for the 10 players in the selected match
-library(tidyr)
-library(pROC)
-library(scales)
-
-# Get the 10 player indices and their names
-players       <- c(home_players[i_match, ], away_players[i_match, ])
-player_names  <- ids[players]
-
-# Extract posterior draws for those players
-# post$player_skill is [draws × P]
-draws_mat     <- post$player_skill[, players]
-colnames(draws_mat) <- player_names
-
-# Reshape to long for ggplot
-player_df <- as.data.frame(draws_mat) %>%
-  pivot_longer(cols      = everything(),
-               names_to  = "Player",
-               values_to = "Skill")
-
-# Plot density for each player
-ggplot(player_df, aes(x = Skill, fill = Player)) +
-  geom_density(alpha = 0.5) +
-  theme_minimal() +
-  labs(
-    title = paste0("Posterior Skill Distributions for Players in Match #", match_ids[i_match]),
-    x     = "Latent Skill",
-    y     = "Density"
-  ) +
-  theme(legend.position = "right")
-
-# 17) Calibration: bin predicted probabilities vs actual outcomes
+# End) Calibration: bin predicted probabilities vs actual outcomes
 n_draws <- nrow(post$player_skill)
 p_draws <- matrix(NA_real_, nrow = n_draws, ncol = M)
 
@@ -587,10 +580,8 @@ for (m in seq_len(M)) {
   S_away <- rowMeans(post$player_skill[, away_players[m, ]]) +
     post$comp_eff[, away_comp[m]] +
     post$patch_comp_eff[, patch_id[m], away_comp[m]]
-  k_match <- patch_id[m]
-  p_draws[, m] <- plogis(post$alpha_win[, k_match] +
-                           post$beta_win[, k_match] * (S_home - S_away))
-}
+  p_draws[, m] <- plogis(post$alpha_win + post$beta_win * (S_home - S_away))
+  }
 
 # 2) Now either
 #  a) Compute the usual point‐estimate with means:

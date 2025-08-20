@@ -66,20 +66,14 @@ if(full_betting_sim){
     cutoff <- cutoff+days(14)
   }
   write_csv(my_res, 'output-data/full_betting_sim_results.csv')
-
-  
-  
 }
 
 limited_betting_sim <- T
 if(limited_betting_sim){
-  models_to_test <- c("Posteriors_fit_2025-08-14 10:46:37.663891.RDS",
-                      "Posteriors_fit_2025-08-14 13:03:14.081701.RDS",
-                      "Posteriors_fit_2025-08-14 15:20:17.865474.RDS",
-                      "Posteriors_fit_2025-08-14 17:37:51.03219.RDS", 
-                      "Posteriors_fit_2025-08-14 20:48:07.332333.RDS",
-                      "Posteriors_fit_2025-08-15 00:00:07.301899.RDS",
-                      "Posteriors_fit_2025-08-15 03:22:40.951723.RDS")
+  models_to_test <- c("Posteriors_fit_2025-08-19 12:57:26.235651.RDS",
+                      "Posteriors_fit_2025-08-19 14:53:02.047383.RDS",
+                      "Posteriors_fit_2025-08-19 16:56:12.932225.RDS",
+                      "Posteriors_fit_2025-08-20 00:02:24.456407.RDS")
   
   lim_sim <- data.frame()
   for(posterior_filename in models_to_test){
@@ -88,6 +82,40 @@ if(limited_betting_sim){
     lim_sim <- rbind(lim_sim, betting_set)
   }
   lim_sim <- unique(lim_sim)
+  lim_sim <- lim_sim[order(lim_sim$first_game_start), ]
 }
 
-ggplot(lim_sim, aes(x=match_date, y=bankroll, col=as.factor(cutoff)))+geom_line()+geom_point()+facet_wrap(.~cutoff, scales = 'free_x')
+bankroll <- data.frame(bank = c(1, rep(NA, nrow(lim_sim))),
+                       match_date = c(min(lim_sim$cutoff), 
+                                      lim_sim$match_date),
+                       return = c(0, lim_sim$ret),
+                       bet = c(0, lim_sim$kelly),
+                       model = c('start', as.character(lim_sim$cutoff)))
+for(i in 2:nrow(bankroll)){
+  bankroll$bank[i] <- bankroll$bank[i-1]*(1+bankroll$return[i])
+}
+
+
+ggplot(bankroll, aes(x=match_date, 
+                     y=bank,
+                     group=1))+
+  geom_hline(aes(yintercept=1), linetype = 2)+
+  geom_line()+
+  geom_point(aes(size=bet, col=model))+
+  geom_smooth(method='lm')+
+  labs(title='Multiple of starting money, by date',
+       x='', y='')+theme_minimal()
+
+ggplot(bankroll, aes(x=1:nrow(bankroll), 
+                     y=bank,
+                     group=1))+
+  geom_hline(aes(yintercept=1), linetype = 2)+
+  geom_line()+
+  geom_point(aes(size=bet, col=model))+
+  geom_smooth(method='lm')+
+  labs(title='Multiple of starting money, by bet',
+       x='', y='')+theme_minimal()
+
+sum(bankroll$bet)
+
+summary(lm(bank ~ match_date, data=bankroll, weights = bet))

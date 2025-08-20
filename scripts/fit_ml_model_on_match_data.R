@@ -23,10 +23,40 @@ cat('\n')
 # Get ML split:
 ml_subset <- raw[raw$match_id %in% as.numeric(splits %>% filter(split == 'ml_match_model') %>% select(match_id) %>% unlist()), ]
 
+# Subset to one (randomly-selected) player or composition observation per side per game
+ml_subset <- ml_subset[sample(1:nrow(ml_subset), nrow(ml_subset)), ]
+ml_subset <- ml_subset[!duplicated(
+  paste0(ml_subset$match_id, '_',  ml_subset$isRadiant)), ]
+
 # Get X-matrix
 X <- ml_subset %>%
-  # Unselect columns where win/loss encoded, or team/match/accounts involved.
-  select(-c(lose, win, loss, comeback, throw, stomp, match_id, series_id, series_type, match_seq_num, radiant_team_id, radiant_name, radiant_logo, region, last_login, is_pro, cluster, radiant_team_complete, dire_team_id, dire_name, dire_logo, dire_team_complete, radiant_captain, dire_captain, account_id, replay_url, party_id, team_number, team_slot, id, match_team, composition, leaguename, rank_tier, personaname, personaname_isNA, leaver_status, replay_salt, leagueid, name, throw_isNA, comeback_isNA, loss_isNA, stomp_isNA))
+  # Unselect columns where win/loss encoded, or team/match/accounts involved, or which are dominated by very late-stage data
+  select(-c(lose, win, loss, comeback, throw, stomp, match_id, series_id, series_type, match_seq_num, radiant_team_id, radiant_name, radiant_logo, region, last_login, is_pro, cluster, radiant_team_complete, dire_team_id, dire_name, dire_logo, dire_team_complete, radiant_captain, dire_captain, account_id, replay_url, party_id, team_number, team_slot, id, match_team, composition, leaguename, rank_tier, personaname, personaname_isNA, leaver_status, replay_salt, leagueid, name, throw_isNA, comeback_isNA, loss_isNA, stomp_isNA,
+            # End state variables:
+            life_state_dead,
+            kda,
+            KDA,
+            net_score,
+            opponent_score,
+            score,
+            net_worth,
+            level,
+            total_gold,
+            total_xp,
+            radiant_gold_adv_end,
+            radiant_xp_adv_end,
+            radiant_gold_adv_end_percent,
+            radiant_xp_adv_end_percent,
+            gold,
+            gold_spent,
+            tower_status_dire,
+            tower_status_radiant,
+            barracks_status_dire,
+            barracks_status_radiant))
+
+# 1) Drop zero-variance cols
+zero_var <- which(sapply(X, function(v) length(unique(v)) <= 1))
+if (length(zero_var)) X <- X[ , -zero_var, drop = FALSE]
 
 # Get Y-vector
 Y <- ml_subset %>% select(win) %>% unlist()
@@ -37,7 +67,8 @@ gbt_fit <- gbt.train(y=Y,
                      x=as.matrix(X),
                      loss_function = 'logloss',
                      verbose = 10,
-                     learning_rate = 0.01)
+                     learning_rate = 0.003,
+                     nrounds = 10000)
 print('Training GBT: complete')
 print(Sys.time())
 

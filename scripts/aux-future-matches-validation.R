@@ -150,14 +150,17 @@ validate_on_future_matches <- function(posterior_file, max_weeks_ahead = 4) {
       post$patch_comp_eff[, patch_id_future[m], away_comp_future[m]]
     
     if ("alpha_win" %in% names(post) && "beta_win" %in% names(post)) {
-      # New calibrated models
+      # Handle both scalar-per-draw and matrix-per-patch alpha/beta
       k_match <- patch_id_future[m]
-      p_draws_future[, m] <- plogis(post$alpha_win[, k_match] +
-                                      post$beta_win[, k_match] * (S_home - S_away))
-    } else {
-      # Older models
+      alpha <- post$alpha_win
+      beta  <- post$beta_win
+      if (is.matrix(alpha)) alpha <- alpha[, k_match]
+      if (is.matrix(beta))  beta  <- beta[,  k_match]
+      p_draws_future[, m] <- plogis(alpha + beta * (S_home - S_away))
+      } else {
+      # Older models without explicit calibration
       p_draws_future[, m] <- plogis(S_home - S_away)
-    }
+      }
     
     # Store mean values for diagnostics
     home_skills[m] <- mean(S_home)

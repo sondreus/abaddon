@@ -23,8 +23,12 @@ comp_ids     <- res$comp_ids
 patch_values <- res$patch_values
 most_recent_match_in_data <- res$most_recent_match
 
-# NEW: load bucket-aware helpers if present; otherwise set safe fallbacks
+# Helper for NULL-coalescing
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# Load bucket-aware helpers if present; otherwise set safe fallbacks
 comp_is_lineup <- res$comp_is_lineup %||% setNames(grepl("^\\d+_\\d+_\\d+_\\d+_\\d+$", comp_ids), comp_ids)
+
 default_idx <- res$default_idx
 if (is.null(default_idx) || is.na(default_idx)) {
   di <- match("pro_lowdata", ids)
@@ -32,8 +36,6 @@ if (is.null(default_idx) || is.na(default_idx)) {
   if (is.na(di)) di <- 1L
   default_idx <- di
 }
-
-`%||%` <- function(x, y) if (is.null(x)) y else x
 
 # 2) The main function (bucket-aware)
 win_prob <- function(comp1, comp2, patch, best_of = 1) {
@@ -82,13 +84,19 @@ win_prob <- function(comp1, comp2, patch, best_of = 1) {
   d_eff   <- (home_player_skill + comp1_eff + patch1_eff) -
     (away_player_skill + comp2_eff + patch2_eff)
 
+  # Outcome calibration: handle both global and hierarchical
   if ("alpha_win" %in% names(post) && "beta_win" %in% names(post)) {
-    k_patch <- pidx  # from earlier match(patch, patch_values)
-    p_draws <- plogis(post$alpha_win[, k_patch] +
-                        post$beta_win[, k_patch] * d_eff)
-  } else {
-    p_draws <- plogis(d_eff)
-  }
+    calib_type <- res$calibration %||% "hierarchical"
+    if (identical(calib_type, "global")) {
+      p_draws <- plogis(post$alpha_win + post$beta_win * d_eff)
+      } else {
+        k_patch <- pidx  # from earlier match(patch, patch_values)
+        p_draws <- plogis(post$alpha_win[, k_patch] +
+                            post$beta_win[, k_patch] * d_eff)
+        }
+    } else {
+      p_draws <- plogis(d_eff)
+      }
   
   if (best_of == 1) return(mean(p_draws))
   
