@@ -10,6 +10,7 @@ library(readr)
 library(anytime)
 library(pROC)
 library(scales)
+library(ggplot2)
 
 # ------------------------------------------------------------------------------
 # 1) Raw data: a data.frame `df` with these columns:
@@ -30,7 +31,7 @@ not_collapsed <- unique(df$match_id[!as.logical(df$collapsed)])
 df <- df %>% filter(match_id %in% not_collapsed)
 
 # Cut-off for betting simulation (now set to middle of sample)
-# df <- df[anytime(df$start_time, calcUnique = T) > as.Date('202-07-22'), ]
+# df <- df[anytime(df$start_time, calcUnique = T) > as.Date('2025-07-22'), ]
 
 # First, collapse patches with insufficient matches
 min_matches <- 400
@@ -40,7 +41,7 @@ patches <- rev(sort(unique(df$patch)))  # newest to oldest
 for (i in 2:length(patches)) {
   n_matches <- sum(df$patch == patches[i]) / 12
   if (n_matches < min_matches) {
-    cat(sprintf("Collapsing patch %s into %s (%d matches)\n", patches[i], patches[i-1], n_matches))
+    cat(sprintf("Collapsing patch %s into %s (%.0f matches)\n", patches[i], patches[i-1], n_matches))
     df$patch[df$patch == patches[i]] <- patches[i-1]
   }
 }
@@ -50,7 +51,7 @@ patches <- rev(sort(unique(df$patch)))  # refresh after collapsing
 if (length(patches) > 1) {
   n_matches_first <- sum(df$patch == patches[1]) / 12
   if (n_matches_first < min_matches) {
-    cat(sprintf("Collapsing patch %s into %s (%d matches)\n", patches[1], patches[2], n_matches_first))
+    cat(sprintf("Collapsing patch %s into %s (%.0f matches)\n", patches[i], patches[i-1], n_matches))
     df$patch[df$patch == patches[1]] <- patches[2]
   }
 }
@@ -71,6 +72,10 @@ if (length(patches_after_collapse) > num_recent_to_keep) {
   message(sprintf('Patches older than the %d most recent collapsed into patch %s to speed up convergence.', 
                   num_recent_to_keep, collapse_target))
 }
+
+# Ensure patches are integers to avoid lexicographic issues
+df$patch <- as.integer(df$patch)
+stopifnot(all(!is.na(df$patch)))
 
 # 2) Flag compositions vs individual players
 df <- df %>%
@@ -106,7 +111,7 @@ P <- length(ids)
 C <- length(comp_ids)
 
 # 4b.1) get the unique patch values (could be integers, strings, whatever)
-patch_values <- sort(unique(df$patch))
+patch_values <- sort(unique(as.integer(df$patch)))
 K            <- length(patch_values)
 
 # 4b.2) for each match, pull its patch value (take the first row for that match)
@@ -128,33 +133,47 @@ away_comp    <- integer(M)
 win_vec      <- integer(M)
 ml_prob_vec  <- numeric(M)
 
+# randomly (but reproducibly) set side A and B.
+set.seed(123)                            # reproducible "random"
+flip_home_is_winner <- sample(c(TRUE, FALSE), M, replace = TRUE)
+
 # 6) Fill them match by match
 for (i in seq_along(match_ids)) {
   mid <- match_ids[i]
   sub <- df %>% filter(match_id == mid)
   comp_sub   <- sub %>% filter(is_comp)
   player_sub <- sub %>% filter(!is_comp)
-
-  # composition → sort by comp_index for a deterministic "home"/"away"
-  # find which comp row actually won
+  
   win_flags <- comp_sub$win
   stopifnot(all(win_flags %in% c(0,1)), length(win_flags)==2)
-  home_i <- which(win_flags==1)
-  away_i <- which(win_flags==0)
-
-  # pick the first composition row as “home,” second as “away”
-  home_comp[i]   <- comp_index[ comp_sub$model_id[1] ]
-  away_comp[i]   <- comp_index[ comp_sub$model_id[2] ]
-
-  # record the actual outcome & ML‐prob of that home side
-  win_vec[i]     <- comp_sub$win   [1]
-  ml_prob_vec[i] <- comp_sub$ml_prob[1]
-
-  # now assign players to home vs away by matching their win flag
-  p_idx <- player_index[player_sub$model_id]
-  home_p <- p_idx[player_sub$win == win_vec[i]]
-  away_p <- p_idx[player_sub$win != win_vec[i]]
-
+  winner_i <- which(win_flags == 1)
+  loser_i  <- which(win_flags == 0)
+  
+  # Random orientation per match, but reproducible:
+  home_is_winner <- flip_home_is_winner[i]
+  
+  if (home_is_winner) {
+    # home = winner, away = loser
+    home_comp[i]   <- unname(comp_index[ comp_sub$model_id[winner_i] ])
+    away_comp[i]   <- unname(comp_index[ comp_sub$model_id[loser_i]  ])
+    win_vec[i]     <- 1L
+    ml_prob_vec[i] <- as.numeric(comp_sub$ml_prob[winner_i])
+    
+    p_idx  <- unname(player_index[player_sub$model_id])
+    home_p <- p_idx[player_sub$win == 1]
+    away_p <- p_idx[player_sub$win == 0]
+  } else {
+    # home = loser, away = winner
+    home_comp[i]   <- unname(comp_index[ comp_sub$model_id[loser_i]  ])
+    away_comp[i]   <- unname(comp_index[ comp_sub$model_id[winner_i] ])
+    win_vec[i]     <- 0L
+    ml_prob_vec[i] <- as.numeric(comp_sub$ml_prob[loser_i])
+    
+    p_idx  <- unname(player_index[player_sub$model_id])
+    home_p <- p_idx[player_sub$win == 0]
+    away_p <- p_idx[player_sub$win == 1]
+  }
+  
   stopifnot(length(home_p) == 5, length(away_p) == 5)
   home_players[i,] <- sort(home_p)
   away_players[i,] <- sort(away_p)
@@ -165,6 +184,11 @@ player_rows    <- df %>% filter(!is_comp) %>% arrange(match_id, model_id)
 Np             <- nrow(player_rows)                   # should be 10 * M
 player_id_vec  <- player_index[player_rows$model_id]        # length Np
 ml_prob_player <- player_rows$ml_prob                  # length Np
+
+# Add clamp:
+eps <- 1e-6
+ml_prob_vec  <- pmin(pmax(ml_prob_vec,  eps), 1 - eps)
+ml_prob_player <- pmin(pmax(ml_prob_player, eps), 1 - eps)
 
 # 7) Package for Stan (add the new entries)
 stan_data <- list(
@@ -212,8 +236,8 @@ parameters {
   vector[C]     z_comp_raw;
   real<lower=0> sigma_comp;
 
-  // patch×comp effects, random walk
-  matrix[K, C]  patch_comp_eff_raw;
+  // patch×comp innovations for anchored random walk (patch 1 = 0)
+  matrix[K-1, C] patch_comp_innov;   // innovations for k = 2..K
   real<lower=0> sigma_patch_comp;
 
   // Global outcome calibration
@@ -230,17 +254,18 @@ parameters {
 }
 
 transformed parameters {
-  vector[P] player_skill = z_player * sigma_player;
+  vector[P] player_skill_raw = z_player * sigma_player;
+  vector[P] player_skill = player_skill_raw - mean(player_skill_raw); // sum-to-zero
   // mean-zero constraint on comp effects
   vector[C] comp_eff = sigma_comp * (z_comp_raw - mean(z_comp_raw));
   
-  // patch×comp deviations: center within each comp so sum_k patch_comp_eff[k,c] = 0
+  // patch×comp deviations: anchored RW with patch 1 = 0 by construction
   matrix[K, C] patch_comp_eff;
   for (c in 1:C) {
-    real mu_c = 0;
-    for (k in 1:K) mu_c += patch_comp_eff_raw[k, c];
-    mu_c /= K;
-    for (k in 1:K) patch_comp_eff[k, c] = patch_comp_eff_raw[k, c] - mu_c;
+    patch_comp_eff[1, c] = 0; // anchor
+    for (k in 2:K)
+      patch_comp_eff[k, c] = patch_comp_eff[k-1, c]
+                           + sigma_patch_comp * patch_comp_innov[k-1, c];
   }
 }
 
@@ -249,14 +274,10 @@ model {
   z_player     ~ normal(0,1);
   z_comp_raw   ~ normal(0,1);
   sigma_player ~ normal(0,2);
-  sigma_comp   ~ normal(0,2);
+  sigma_comp   ~ normal(0,3);
 
-  sigma_patch_comp ~ normal(0,1);
-  for (c in 1:C) {
-    patch_comp_eff_raw[1, c] ~ normal(0, sigma_patch_comp);
-    for (k in 2:K)
-      patch_comp_eff_raw[k, c] ~ normal(patch_comp_eff_raw[k-1, c], sigma_patch_comp);
-  }
+  sigma_patch_comp ~ normal(0,1.5);
+  to_vector(patch_comp_innov) ~ normal(0,1);  // RW innovations
 
   // Global priors for outcome calibration
   alpha_win ~ normal(0,1);
@@ -383,6 +404,7 @@ breakdown <- data.frame(
 breakdown$Percentage <- 100 * breakdown$Count / total_params
 print(breakdown)
 
+cat("\n\n=== STAN MODEL BEGINS TRAINING ===\n\n")
 print(start_time <- Sys.time())
 fit <- stan(
   model_code = stan_code,
@@ -395,6 +417,7 @@ fit <- stan(
   control    = list(adapt_delta = 0.95)
 )
 print(end_time <- Sys.time())
+cat("\n\n=== STAN MODEL TRAINING ENDED ===\n\n")
 saveRDS(list(fit, start_time, end_time, "total_params" = total_params, "match_ids" = unique(df$match_id)), paste0('Fit_timing_param_count_n_matches_', Sys.time(), '.RDS'))
 
 # Save posterior draws & metadata for later win‐prob function
@@ -638,7 +661,7 @@ calib_samp %>%
 #             n         = n()) %>%
 #   ggplot(aes(mean_pred, obs_rate, size = n)) +
 #   geom_point(alpha = 0.7) +
-#   geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+#   geom_abline(slope = 1, intercept = 0, linetype = "das hed") +
 #   coord_equal() +
 #   scale_x_continuous("Predicted P(home win)", labels = percent_format()) +
 #   scale_y_continuous("Observed win rate",   labels = percent_format()) +
@@ -652,4 +675,9 @@ save_diagnostics()
 
 source('scripts/aux-future-matches-validation.R')
 results <- validate_on_future_matches(posterior_filename, max_weeks_ahead = 4)
-
+# 
+# # Platt scaling on OoS set
+# m <- glm(win ~ qlogis(win_prob), data = results$calib_mean, family = binomial())
+# p_platt <- plogis(predict(m, newdata = data.frame(win_prob = results$calib_mean$win_prob), type = "link"))
+# auc_platt   <- pROC::auc(pROC::roc(results$calib_mean$win, p_platt, quiet=TRUE))
+# brier_platt <- mean((results$calib_mean$win - p_platt)^2)

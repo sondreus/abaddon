@@ -66,7 +66,7 @@ print(Sys.time())
 gbt_fit <- gbt.train(y=Y,
                      x=as.matrix(X),
                      loss_function = 'logloss',
-                     verbose = 10,
+                     verbose = 100,
                      learning_rate = 0.003,
                      nrounds = 10000)
 print('Training GBT: complete')
